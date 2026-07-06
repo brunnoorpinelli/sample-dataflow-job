@@ -77,8 +77,26 @@ V003,Monitor 27 Polegadas,2,1450.00
 ## Pré-requisitos
 
 - [gcloud CLI](https://cloud.google.com/sdk/docs/install) instalado e autenticado (`gcloud auth login`);
+- **Credenciais de aplicação (ADC)**: o Maven/Beam NÃO usa a credencial do
+  `gcloud auth login`, e sim as *Application Default Credentials*. Rode também:
+
+  ```bash
+  gcloud auth application-default login
+  ```
+
+  > ⚠️ Se você estiver rodando de dentro de uma **VM do GCE / Cloud Shell / Cloud
+  > Workstations**, a ADC é a **service account da VM** — é ELA quem submete o
+  > job e precisa dos papéis de "quem submete" da tabela do Passo 4.
 - **Java 17** e **Maven 3.8+**;
-- Um projeto GCP com billing ativo;
+- Um projeto GCP com billing ativo. Se precisar criar um:
+
+  ```bash
+  gcloud projects create meu-projeto-df --name="demo-dataflow"
+  gcloud billing projects link meu-projeto-df --billing-account=SEU_BILLING_ACCOUNT_ID
+  ```
+
+  > 💡 IDs de projeto começando com `demo` são rejeitados pelo GCP
+  > (`project_id contains prohibited words`). Use, por exemplo, `dataflow-demo-...`.
 - Permissão para criar service accounts e conceder papéis IAM no projeto;
 - Se o projeto está em um perímetro **VPC-SC**: os serviços `dataflow.googleapis.com`, `storage.googleapis.com` e `spanner.googleapis.com` devem estar protegidos **no mesmo perímetro** (ou com regras de ingress/egress adequadas).
 
@@ -177,9 +195,11 @@ gcloud iam service-accounts create $SA_NAME \
   --display-name="Dataflow CSV -> Spanner (exemplo)"
 
 # 4.2 Papel de worker do Dataflow (obrigatório para qualquer job)
+#     (--condition=None evita prompt interativo em orgs que usam IAM conditions)
 gcloud projects add-iam-policy-binding $PROJECT_ID \
   --member="serviceAccount:$SA_EMAIL" \
-  --role="roles/dataflow.worker"
+  --role="roles/dataflow.worker" \
+  --condition=None
 
 # 4.3 Acesso ao bucket (ler o CSV + escrever staging/temp)
 gcloud storage buckets add-iam-policy-binding gs://$BUCKET \
@@ -192,11 +212,29 @@ gcloud spanner databases add-iam-policy-binding $SPANNER_DB \
   --member="serviceAccount:$SA_EMAIL" \
   --role="roles/spanner.databaseUser"
 
-# 4.5 VOCÊ (quem submete o job) precisa poder "usar" essa service account
+# 4.5 QUEM SUBMETE o job precisa poder "usar" essa service account
 gcloud iam service-accounts add-iam-policy-binding $SA_EMAIL \
   --member="user:$(gcloud config get-value account)" \
   --role="roles/iam.serviceAccountUser"
 ```
+
+> ⚠️ **Se quem submete NÃO é você** (ex.: rodando de uma VM, cuja ADC é a
+> service account da VM), conceda a essa identidade os papéis de submissão:
+>
+> ```bash
+> export SUBMITTER="serviceAccount:SA_DA_SUA_VM@developer.gserviceaccount.com"
+>
+> gcloud projects add-iam-policy-binding $PROJECT_ID \
+>   --member="$SUBMITTER" --role="roles/dataflow.developer" --condition=None
+>
+> # Precisa ser storage.admin no bucket: o Beam valida o bucket com
+> # storage.buckets.get, permissão que roles/storage.objectAdmin NÃO tem.
+> gcloud storage buckets add-iam-policy-binding gs://$BUCKET \
+>   --member="$SUBMITTER" --role="roles/storage.admin"
+>
+> gcloud iam service-accounts add-iam-policy-binding $SA_EMAIL \
+>   --member="$SUBMITTER" --role="roles/iam.serviceAccountUser"
+> ```
 
 ### Resumo das permissões
 
@@ -205,8 +243,9 @@ gcloud iam service-accounts add-iam-policy-binding $SA_EMAIL \
 | `dataflow-csv-spanner@...` | `roles/dataflow.worker` | Projeto | Workers executarem o job |
 | `dataflow-csv-spanner@...` | `roles/storage.objectAdmin` | Bucket | Ler CSV, escrever staging/temp |
 | `dataflow-csv-spanner@...` | `roles/spanner.databaseUser` | Banco `vendas-db` | Escrever na tabela `vendas` |
-| Você (usuário) | `roles/dataflow.developer` | Projeto | Submeter/gerenciar jobs |
-| Você (usuário) | `roles/iam.serviceAccountUser` | Service account | Anexar a SA ao job |
+| Quem submete (você ou SA da VM) | `roles/dataflow.developer` | Projeto | Submeter/gerenciar jobs |
+| Quem submete (você ou SA da VM) | `roles/storage.admin` | Bucket | Subir os jars de staging (o Beam exige `storage.buckets.get`) |
+| Quem submete (você ou SA da VM) | `roles/iam.serviceAccountUser` | Service account | Anexar a SA ao job |
 | `service-PROJECT_NUMBER@dataflow-service-producer-prod.iam.gserviceaccount.com` | `roles/dataflow.serviceAgent` | Projeto | Agente do Dataflow (criado/concedido automaticamente ao habilitar a API) |
 
 > 💡 Se você já é `Owner`/`Editor` do projeto, os papéis de usuário acima já estão cobertos.
@@ -216,7 +255,21 @@ gcloud iam service-accounts add-iam-policy-binding $SA_EMAIL \
 ## Passo 5 — Rede em ambiente VPC-SC
 
 Em um perímetro VPC-SC, os workers **não podem ter IP público** e precisam
-alcançar as APIs do Google pela rede privada. Dois requisitos:
+alcançar as APIs do Google pela rede privada.
+
+**5.0 — Se você ainda não tem VPC/subrede** (muitas orgs apagam a rede
+`default` via org policy `compute.skipDefaultNetworkCreation` — o erro típico é
+`The resource '.../subnetworks/default' was not found`):
+
+```bash
+gcloud compute networks create $NETWORK --subnet-mode=custom
+
+gcloud compute networks subnets create $SUBNETWORK \
+  --network=$NETWORK \
+  --region=$REGION \
+  --range=10.10.0.0/24 \
+  --enable-private-ip-google-access   # já cria com PGA; Passo 5.1 vira opcional
+```
 
 **5.1 — A subrede precisa de Private Google Access habilitado** (é assim que os
 workers, sem IP público, alcançam Cloud Storage/Spanner):
@@ -320,11 +373,17 @@ Saída esperada (o `valor_total` foi calculado pelo job):
 
 ```
 venda_id  produto               quantidade  preco_unitario  valor_total
-V001      Teclado Mecanico      3           250.0           750.0
+V001      Teclado Mecanico      3           250             750
 V002      Mouse Gamer           5           120.5           602.5
-V003      Monitor 27 Polegadas  2           1450.0          2900.0
+V003      Monitor 27 Polegadas  2           1450            2900
+...
+V007      Hub USB-C             6           89.9            539.4000000000001
 ...
 ```
+
+> 💡 Notou o `539.4000000000001`? É a imprecisão binária do `FLOAT64`
+> (6 × 89.90). Em sistemas financeiros reais, use o tipo `NUMERIC` no Spanner
+> e `BigDecimal` no Java.
 
 ---
 
@@ -342,6 +401,9 @@ gcloud iam service-accounts delete $SA_EMAIL --quiet
 
 # Apaga a regra de firewall
 gcloud compute firewall-rules delete dataflow-internal --quiet
+
+# Ou, se o projeto foi criado só para este exemplo, apague tudo de uma vez:
+gcloud projects delete $PROJECT_ID
 ```
 
 ---
@@ -355,6 +417,9 @@ gcloud compute firewall-rules delete dataflow-internal --quiet
 | `Current user cannot act as service account` | Falta `iam.serviceAccountUser` | Rode o comando 4.5 |
 | Job fica preso em "Starting" | Firewall bloqueando portas 12345-12346 | Rode o comando do Passo 5.2 |
 | `PERMISSION_DENIED: spanner.sessions.create` | SA sem acesso ao banco | Rode o comando 4.4 |
+| `403 Forbidden ... does not have storage.buckets.get` ao submeter | ADC de quem submete sem acesso ao bucket (comum em VM: a ADC é a SA da VM, não seu usuário) | Conceda os papéis de submissão à identidade da ADC (caixa do Passo 4.5); aguarde ~1 min a propagação do IAM |
+| `The resource '.../subnetworks/default' was not found` | Org policy apagou a rede `default` | Crie VPC e subrede (Passo 5.0) |
+| Job roda mas nenhum log aparece no terminal (`SLF4J: ... NOP logger`) | Binding slf4j 2.x com slf4j-api 1.7 do Beam | Use `slf4j-simple` 1.7.x (já corrigido no `pom.xml`) |
 
 ---
 
