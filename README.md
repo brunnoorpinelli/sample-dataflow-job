@@ -87,7 +87,7 @@ V003,Monitor 27 Polegadas,2,1450.00
   > ⚠️ Se você estiver rodando de dentro de uma **VM do GCE / Cloud Shell / Cloud
   > Workstations**, a ADC é a **service account da VM** — é ELA quem submete o
   > job e precisa dos papéis de "quem submete" da tabela do Passo 4.
-- **Java 17** e **Maven 3.8+**;
+- **Java 21** e **Maven 3.8+**;
 - Um projeto GCP com billing ativo. Se precisar criar um:
 
   ```bash

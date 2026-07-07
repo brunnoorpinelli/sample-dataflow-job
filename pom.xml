@@ -10,8 +10,7 @@
   <packaging>jar</packaging>
 
   <properties>
-    <maven.compiler.source>17</maven.compiler.source>
-    <maven.compiler.target>17</maven.compiler.target>
+    <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <beam.version>2.60.0</beam.version>
 <!-- Precisa ser 1.7.x: o Beam usa slf4j-api 1.7 e o binding 2.x não é compatível -->
